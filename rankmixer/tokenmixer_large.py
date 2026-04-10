@@ -86,14 +86,14 @@ class TokenMixerMixing(BaseModel):
         super().__init__(model_cfg=model_cfg, common_hp=common_hp, model_cls_dict=model_cls_dict)
         self.T = model_cfg[Const.HP].get("T")
         self.inner_dim = model_cfg[Const.HP].get("inner_dim")
-        self.num_heads = model_cfg[Const.HP].get("num_heads")
-        assert self.inner_dim % self.num_heads == 0, \
-            f"inner_dim ({self.inner_dim}) must be divisible by num_heads ({self.num_heads})"
+        self.H = model_cfg[Const.HP].get("H")
+        assert self.inner_dim % self.H == 0, \
+            f"inner_dim ({self.inner_dim}) must be divisible by H ({self.H})"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, D) -> (B, H, T*D/H)"""
         B, T, D = x.shape
-        H = self.num_heads
+        H = self.H
         d = D // H  # per-head dim
         return (
             x.view(B, T, H, d)          # (B, T, H, D/H)
@@ -120,7 +120,7 @@ class TokenMixerReverting(BaseModel):
         super().__init__(model_cfg=model_cfg, common_hp=common_hp, model_cls_dict=model_cls_dict)
         self.T = model_cfg[Const.HP].get("T")
         self.inner_dim = model_cfg[Const.HP].get("inner_dim")
-        self.num_heads = model_cfg[Const.HP].get("num_heads")
+        self.H = model_cfg[Const.HP].get("H")
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """h: (B, H, T*D/H) -> (B, T, D)"""
@@ -374,8 +374,8 @@ class TokenMixerLargeBlock(BaseModel):
 
         inner_dim = model_cfg[Const.HP].get("inner_dim")
         T = model_cfg[Const.HP].get("T")
-        # num_heads H 默认等于 T，此时 mixing 输出 (B, T, D) 与输入同形
-        num_heads = model_cfg[Const.HP].get("num_heads", T)
+        # H 默认等于 T，此时 mixing 输出 (B, T, D) 与输入同形
+        H = model_cfg[Const.HP].get("H", T)
         num_routed_experts = model_cfg[Const.HP].get("num_routed_experts")
         top_k = model_cfg[Const.HP].get("top_k")
         k = model_cfg[Const.HP].get("k")
@@ -384,8 +384,8 @@ class TokenMixerLargeBlock(BaseModel):
 
         # mixing 输出的 token 数和维度
         # (B, T, D) → Mixing → (B, H, T*D/H)
-        mixed_tokens = num_heads
-        mixed_dim = T * inner_dim // num_heads
+        mixed_tokens = H
+        mixed_dim = T * inner_dim // H
 
         # Pre-Norm: 两个 RMSNorm 分别作用于 (B,T,D) 空间
         self.norm1 = RMSNormNPU(inner_dim, Const.EPS)
@@ -395,7 +395,7 @@ class TokenMixerLargeBlock(BaseModel):
         self.model_cfg[Const.SUB_MODELS]["TokenMixerMixing"][Const.HP] = {
             "T": T,
             "inner_dim": inner_dim,
-            "num_heads": num_heads,
+            "H": H,
         }
         self.mixing = self.init_sub_model("TokenMixerMixing")
 
@@ -403,7 +403,7 @@ class TokenMixerLargeBlock(BaseModel):
         self.model_cfg[Const.SUB_MODELS]["TokenMixerReverting"][Const.HP] = {
             "T": T,
             "inner_dim": inner_dim,
-            "num_heads": num_heads,
+            "H": H,
         }
         self.reverting = self.init_sub_model("TokenMixerReverting")
 
@@ -492,10 +492,10 @@ class TokenMixerLarge(BaseModel):
             )
 
         inner_dim = int(num_local_tokens * t_multiplier)
-        # num_heads 默认等于 T，此时 S-P MoE 1/2 的参数量相同
-        num_heads = model_cfg[Const.HP].get("num_heads", T)
-        assert inner_dim % num_heads == 0, \
-            f"inner_dim ({inner_dim}) must be divisible by num_heads ({num_heads})"
+        # H 默认等于 T，此时 S-P MoE 1/2 的参数量相同
+        H = model_cfg[Const.HP].get("H", T)
+        assert inner_dim % H == 0, \
+            f"inner_dim ({inner_dim}) must be divisible by H ({H})"
 
         self.interval_residual_every = interval_residual_every
 
@@ -513,7 +513,7 @@ class TokenMixerLarge(BaseModel):
         self.model_cfg[Const.SUB_MODELS]["TokenMixerLargeBlock"][Const.HP] = {
             "inner_dim": inner_dim,
             "T": T,
-            "num_heads": num_heads,
+            "H": H,
             "num_routed_experts": num_routed_experts,
             "top_k": top_k,
             "k": k,
