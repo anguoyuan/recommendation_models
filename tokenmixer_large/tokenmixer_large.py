@@ -352,21 +352,14 @@ class TokenMixerLargeBlock(BaseModel):
     """
     TokenMixer-Large Block (Section 3.4)
 
-    每个 Block 的结构为:
-        (RMSNorm → Mixing → S-P MoE → Reverting) + Residual
-        (RMSNorm → S-P MoE) + Residual
+    严格按照论文公式 9-16 实现:
 
-    采用 Pre-Norm 风格 (RMSNorm)，经消融实验验证优于 Post-Norm。
+        Eq 9-11: H = Mixing(X)                          X(B,T,D) → H(B,H,T*D/H)
+        Eq 12:   H_next = Norm(pSwiGLU(H) + H)          Post-Norm, 残差为 H 自身
+        Eq 13-15: X_revert = Reverting(H_next)          H(B,H,T*D/H) → X_revert(B,T,D)
+        Eq 16:   X_next = Norm(pSwiGLU(X_revert) + X)   Post-Norm, 残差为原始输入 X
 
-    第一个 S-P MoE 在 mixed token 空间中操作 (channel mixing)；
-    第二个 S-P MoE 在恢复后的 original token 空间中操作。
-    Reverting 操作保证了残差连接的维度一致性。
-
-    伪代码:
-        h = Reverting(S_P_MoE_1(Mixing(RMSNorm(x))))
-        x = x + h
-        y = S_P_MoE_2(RMSNorm(x))
-        x = x + y
+    注意: Eq 16 的残差跳过 Mixing+MoE+Reverting 直接连回原始 X，而非 X_revert。
     """
 
     def __init__(self, model_cfg: Dict, common_hp: Dict, model_cls_dict: Dict):
@@ -387,8 +380,9 @@ class TokenMixerLargeBlock(BaseModel):
         mixed_tokens = H
         mixed_dim = T * inner_dim // H
 
-        # Pre-Norm: 两个 RMSNorm 分别作用于 (B,T,D) 空间
-        self.norm1 = RMSNormNPU(inner_dim, Const.EPS)
+        # Post-Norm (Eq 12): 作用于 mixed 空间 (B, H, T*D/H)
+        self.norm1 = RMSNormNPU(mixed_dim, Const.EPS)
+        # Post-Norm (Eq 16): 作用于 original 空间 (B, T, D)
         self.norm2 = RMSNormNPU(inner_dim, Const.EPS)
 
         # Mixing (B, T, D) → (B, H, T*D/H)
@@ -436,19 +430,21 @@ class TokenMixerLargeBlock(BaseModel):
         self.sp_moe_2 = self.init_sub_model("SparsePerTokenMoE")
 
     def forward(self, x: torch.Tensor, loss_old: torch.Tensor, sparsity_old: torch.Tensor):
-        # ---- 第一路: Mixing path ----
-        h = self.norm1(x)
-        h = self.mixing(h)
-        h, (loss1, sp1) = self.sp_moe_1(h)
-        h = self.reverting(h)
-        x = x + h  # residual
+        # Eq 9-11: Mixing  X(B,T,D) → H(B,H,T*D/H)
+        H_mixed = self.mixing(x)
 
-        # ---- 第二路: Channel path ----
-        y = self.norm2(x)
-        y, (loss2, sp2) = self.sp_moe_2(y)
-        x = x + y  # residual
+        # Eq 12: H_next = Norm(pSwiGLU(H) + H)  — Post-Norm, 残差为 H 自身
+        moe1_out, (loss1, sp1) = self.sp_moe_1(H_mixed)
+        H_next = self.norm1(moe1_out + H_mixed)
 
-        return x, (loss_old + loss1 + loss2, sparsity_old + sp1 + sp2)
+        # Eq 13-15: Reverting  H(B,H,T*D/H) → X_revert(B,T,D)
+        X_revert = self.reverting(H_next)
+
+        # Eq 16: X_next = Norm(pSwiGLU(X_revert) + X)  — Post-Norm, 残差为原始 x
+        moe2_out, (loss2, sp2) = self.sp_moe_2(X_revert)
+        X_next = self.norm2(moe2_out + x)
+
+        return X_next, (loss_old + loss1 + loss2, sparsity_old + sp1 + sp2)
 
 
 @ModelRegistry.register(req_subs={"TokenMixerLargeInput", "TokenMixerLargeBlock"})
