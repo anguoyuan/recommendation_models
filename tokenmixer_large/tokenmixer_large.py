@@ -550,7 +550,9 @@ class TokenMixerLarge(BaseModel):
         if num_moe > 0:
             l1_loss = l1_loss / num_moe
             sparsity = sparsity / num_moe
-        l1_loss = l1_loss.mean()
+            l1_loss = l1_loss.mean()
+        else:
+            l1_loss = torch.tensor(0.0)
 
         output = self.output_proj(h_out)
         y = output.view(B, N, -1)
