@@ -67,22 +67,40 @@ class TokenMixerLargeInput(BaseModel):
 @ModelRegistry.register()
 class TokenMixerMixing(BaseModel):
     """
-    TokenMixer-Large 的 Token Mixing 模块 (Section 3.2)
+    TokenMixer-Large 的 Multi-Head Token Mixing 模块 (Section 3.2)
 
-    无参数的 token mixing 操作，通过 transpose + reshape 实现跨 token 的信息混合。
-    此操作将 token 维度和 channel 维度的信息进行重排，使不同 token 间的特征发生交互。
+    将每个 token 的 embedding 均匀拆分为 H 个 head，再将所有 token 的同一个 head
+    拼接在一起，形成 H 个"混合 token"，每个混合 token 的维度为 T*D/H。
 
-    操作: X(B, T, D) → transpose → (B, D, T) → view → (B, T, D)
+    公式: s_h = Concat(x_1^h, x_2^h, ..., x_T^h),  h = 1..H
+    其中 x_t^h 是第 t 个 token 的第 h 个 head 切片 (维度 D/H)
+
+    操作步骤:
+        (B, T, D) → view(B, T, H, D/H) → permute(0,2,1,3)
+                  → (B, H, T, D/H)    → view(B, H, T*D/H)
+
+    默认 H = T，此时输出 (B, T, T*D/T) = (B, T, D)，形状与输入一致。
     """
 
     def __init__(self, model_cfg: Dict, common_hp: Dict, model_cls_dict: Dict):
         super().__init__(model_cfg=model_cfg, common_hp=common_hp, model_cls_dict=model_cls_dict)
         self.T = model_cfg[Const.HP].get("T")
         self.inner_dim = model_cfg[Const.HP].get("inner_dim")
+        self.num_heads = model_cfg[Const.HP].get("num_heads")
+        assert self.inner_dim % self.num_heads == 0, \
+            f"inner_dim ({self.inner_dim}) must be divisible by num_heads ({self.num_heads})"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, D) -> (B, H, T*D/H)"""
         B, T, D = x.shape
-        return x.transpose(1, 2).contiguous().view(B, T, D)
+        H = self.num_heads
+        d = D // H  # per-head dim
+        return (
+            x.view(B, T, H, d)          # (B, T, H, D/H)
+             .permute(0, 2, 1, 3)        # (B, H, T, D/H)
+             .contiguous()
+             .view(B, H, T * d)          # (B, H, T*D/H)
+        )
 
 
 @ModelRegistry.register()
@@ -90,22 +108,31 @@ class TokenMixerReverting(BaseModel):
     """
     TokenMixer-Large 的 Token Reverting 模块 (Section 3.2)
 
-    Mixing 的逆操作。恢复原始 token 维度排列，确保残差连接的维度一致性。
-    这是 TokenMixer-Large 相比原始 RankMixer 的关键改进——通过对称的
-    "Mixing–Reverting"设计，解决了 T ≠ D 时的维度不匹配问题，
-    使残差信号可以在任意深度的网络中稳定传播。
+    TokenMixerMixing 的严格逆操作。将混合后的 (B, H, T*D/H) 还原为 (B, T, D)，
+    保证残差连接的维度一致性，使残差信号在任意深度的网络中稳定传播。
 
-    操作: H(B, T, D) → view(B, D, T) → transpose → (B, T, D)
+    操作步骤 (Mixing 的逆):
+        (B, H, T*D/H) → view(B, H, T, D/H) → permute(0,2,1,3)
+                      → (B, T, H, D/H)     → view(B, T, D)
     """
 
     def __init__(self, model_cfg: Dict, common_hp: Dict, model_cls_dict: Dict):
         super().__init__(model_cfg=model_cfg, common_hp=common_hp, model_cls_dict=model_cls_dict)
         self.T = model_cfg[Const.HP].get("T")
         self.inner_dim = model_cfg[Const.HP].get("inner_dim")
+        self.num_heads = model_cfg[Const.HP].get("num_heads")
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        B, T, D = h.shape
-        return h.view(B, D, T).transpose(1, 2).contiguous()
+        """h: (B, H, T*D/H) -> (B, T, D)"""
+        B, H, _ = h.shape
+        T = self.T
+        d = self.inner_dim // H  # = D/H
+        return (
+            h.view(B, H, T, d)          # (B, H, T, D/H)
+             .permute(0, 2, 1, 3)        # (B, T, H, D/H)
+             .contiguous()
+             .view(B, T, H * d)          # (B, T, D)
+        )
 
 
 # =============================================================================
@@ -347,32 +374,56 @@ class TokenMixerLargeBlock(BaseModel):
 
         inner_dim = model_cfg[Const.HP].get("inner_dim")
         T = model_cfg[Const.HP].get("T")
+        # num_heads H 默认等于 T，此时 mixing 输出 (B, T, D) 与输入同形
+        num_heads = model_cfg[Const.HP].get("num_heads", T)
         num_routed_experts = model_cfg[Const.HP].get("num_routed_experts")
         top_k = model_cfg[Const.HP].get("top_k")
         k = model_cfg[Const.HP].get("k")
         dropout_p = model_cfg[Const.HP].get("dropout_p")
         down_init_scale = model_cfg[Const.HP].get("down_init_scale", 1.0)
 
-        # Pre-Norm: RMSNorm
+        # mixing 输出的 token 数和维度
+        # (B, T, D) → Mixing → (B, H, T*D/H)
+        mixed_tokens = num_heads
+        mixed_dim = T * inner_dim // num_heads
+
+        # Pre-Norm: 两个 RMSNorm 分别作用于 (B,T,D) 空间
         self.norm1 = RMSNormNPU(inner_dim, Const.EPS)
         self.norm2 = RMSNormNPU(inner_dim, Const.EPS)
 
-        # Mixing
+        # Mixing (B, T, D) → (B, H, T*D/H)
         self.model_cfg[Const.SUB_MODELS]["TokenMixerMixing"][Const.HP] = {
             "T": T,
             "inner_dim": inner_dim,
+            "num_heads": num_heads,
         }
         self.mixing = self.init_sub_model("TokenMixerMixing")
 
-        # Reverting
+        # Reverting (B, H, T*D/H) → (B, T, D)
         self.model_cfg[Const.SUB_MODELS]["TokenMixerReverting"][Const.HP] = {
             "T": T,
             "inner_dim": inner_dim,
+            "num_heads": num_heads,
         }
         self.reverting = self.init_sub_model("TokenMixerReverting")
 
-        # S-P MoE (shared config for both)
-        moe_hp = {
+        # S-P MoE 1: 在 mixed token 空间 (B, H, T*D/H) 上操作
+        # num_tokens = H, inner_dim = T*D/H
+        self.model_cfg[Const.SUB_MODELS]["SparsePerTokenMoE"][Const.HP] = {
+            "num_routed_experts": num_routed_experts,
+            "inner_dim": mixed_dim,
+            "num_tokens": mixed_tokens,
+            "k": k,
+            "top_k": top_k,
+            "bias": True,
+            "dropout_p": dropout_p,
+            "down_init_scale": down_init_scale,
+        }
+        self.sp_moe_1 = self.init_sub_model("SparsePerTokenMoE")
+
+        # S-P MoE 2: 在 original token 空间 (B, T, D) 上操作
+        # num_tokens = T, inner_dim = D
+        self.model_cfg[Const.SUB_MODELS]["SparsePerTokenMoE"][Const.HP] = {
             "num_routed_experts": num_routed_experts,
             "inner_dim": inner_dim,
             "num_tokens": T,
@@ -382,11 +433,6 @@ class TokenMixerLargeBlock(BaseModel):
             "dropout_p": dropout_p,
             "down_init_scale": down_init_scale,
         }
-        self.model_cfg[Const.SUB_MODELS]["SparsePerTokenMoE"][Const.HP] = moe_hp
-
-        # S-P MoE 1: 在 mixed token 空间操作
-        self.sp_moe_1 = self.init_sub_model("SparsePerTokenMoE")
-        # S-P MoE 2: 在 original token 空间操作
         self.sp_moe_2 = self.init_sub_model("SparsePerTokenMoE")
 
     def forward(self, x: torch.Tensor, loss_old: torch.Tensor, sparsity_old: torch.Tensor):
@@ -446,6 +492,10 @@ class TokenMixerLarge(BaseModel):
             )
 
         inner_dim = int(num_local_tokens * t_multiplier)
+        # num_heads 默认等于 T，此时 S-P MoE 1/2 的参数量相同
+        num_heads = model_cfg[Const.HP].get("num_heads", T)
+        assert inner_dim % num_heads == 0, \
+            f"inner_dim ({inner_dim}) must be divisible by num_heads ({num_heads})"
 
         self.interval_residual_every = interval_residual_every
 
@@ -463,6 +513,7 @@ class TokenMixerLarge(BaseModel):
         self.model_cfg[Const.SUB_MODELS]["TokenMixerLargeBlock"][Const.HP] = {
             "inner_dim": inner_dim,
             "T": T,
+            "num_heads": num_heads,
             "num_routed_experts": num_routed_experts,
             "top_k": top_k,
             "k": k,
